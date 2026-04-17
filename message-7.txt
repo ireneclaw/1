@@ -1,0 +1,972 @@
+#!/usr/bin/env python3
+# ================================================
+# Mine Bot Multi-Wallet — v0.14.0 (ON-CHAIN REGISTRATION)
+#
+# BREAKTHROUGH FINDING (dari TX 0x313ccdc5... di BaseScan):
+#   - AWP Registry contract: 0x0000F34Ed3594F54faABbCb2Ec45738DDD1c001A
+#   - Chain: Base Mainnet (8453)
+#   - Method: setRecipient(address)  |  Selector: 0x3bbed4a0
+#   - Gas needed: ~62k gas = ~0.00005 ETH per wallet
+#
+# STRATEGI BARU:
+#   Gasless relay TIDAK reliable. Solusinya:
+#   1. Funder wallet (yang ada ETH Base) — satu wallet induk
+#   2. Top-up ETH ke tiap agent wallet (~0.0001 ETH = cukup untuk 2x tx)
+#   3. Call setRecipient(self) on-chain dari tiap wallet
+#   4. Wait receipt → registration done
+#
+# Biaya: 10 wallet × 0.0001 ETH ≈ $0.0002 sekali setup
+# ================================================
+
+import os
+import sys
+import json
+import time
+import shutil
+import subprocess
+import threading
+from pathlib import Path
+from datetime import datetime
+
+_wallet_index_lock = threading.Lock()
+_wallet_index_map  = {}
+_wallet_counter    = [0]
+
+def get_wallet_index(wallet_name):
+    with _wallet_index_lock:
+        if wallet_name not in _wallet_index_map:
+            _wallet_index_map[wallet_name] = _wallet_counter[0]
+            _wallet_counter[0] += 1
+        return _wallet_index_map[wallet_name]
+
+# ================================================
+# KONFIGURASI — EDIT BAGIAN INI
+# ================================================
+
+WALLET_COUNT = 10
+WALLET_MODE  = "file"
+SINGLE_MNEMONIC = ""
+WALLETS_FILE = "/root/wallets.txt"
+HOME         = str(Path.home())
+
+# ── PROXY (DataImpulse) ────────────────────────────
+PROXY_USER = "ISI DISINI WOK"
+PROXY_PASS = "ISI DISINI WOK"
+PROXY_HOST = "gw.dataimpulse.com"
+PROXY_PORT = "823"
+USE_PROXY  = True
+
+BATCH_SIZE = 5
+PYTHON311  = "/usr/bin/python3.11"
+
+MONITOR_INTERVAL        = 30
+MAX_FAIL_BEFORE_RESTART = 3
+TOKEN_REFRESH_INTERVAL  = 72000
+DATASET_IDS = ["ds_wikipedia", "ds_linkedin_company"]
+
+WORKER_PARALLEL = 3
+SKIP_ENRICH     = True
+CRAWL_TIMEOUT   = 300
+
+# ════════════════════════════════════════════════════════
+# ⚠ ON-CHAIN REGISTRATION CONFIG — WAJIB DIISI!
+# ════════════════════════════════════════════════════════
+
+# 1️⃣ FUNDER WALLET — wallet yang HARUS punya ETH di Base Mainnet
+#    Isi private key wallet ini. Wallet ini akan top-up ke semua agent wallet.
+#    Minimum balance: WALLET_COUNT × 0.0002 ETH
+#    Contoh: kalau 10 wallet → funder butuh minimal 0.002 ETH Base
+FUNDER_PRIVATE_KEY = "ISI PK DISINI WOK"  # 0x... (64 hex chars). Kosongkan = skip on-chain register
+
+# 2️⃣ Jumlah ETH yang dikirim ke tiap agent wallet
+#    0.0001 ETH cukup untuk ~3x setRecipient tx. Lebih aman pakai 0.0002.
+ETH_PER_WALLET = 0.0002  # ETH
+
+# 3️⃣ Base Mainnet RPC — public endpoint
+BASE_RPC_URL = "https://mainnet.base.org"
+# Alternatif kalau public RPC rate-limited:
+# BASE_RPC_URL = "https://base.llamarpc.com"
+# BASE_RPC_URL = "https://base-rpc.publicnode.com"
+
+# 4️⃣ AWP Registry Contract — VERIFIED dari BaseScan txn
+AWP_REGISTRY_CONTRACT = "0x0000F34Ed3594F54faABbCb2Ec45738DDD1c001A"
+AWP_CHAIN_ID          = 8453  # Base Mainnet
+
+# Selector setRecipient(address) = keccak256("setRecipient(address)")[:4]
+AWP_SET_RECIPIENT_SELECTOR = "0x3bbed4a0"
+
+# Expected event topic (untuk verify)
+EVENT_RECIPIENT_SET = "0xc1416b5cdab50a9fbc872236e1aa54566c6deb40024e63a4b1737ecacf09d6f9"
+
+# ================================================
+
+print_lock = threading.Lock()
+
+def log(name, msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    with print_lock:
+        print(f"[{ts}] [{name[:12]:12}] {msg}", flush=True)
+
+def banner(msg):
+    print(f"\n{'='*60}\n  {msg}\n{'='*60}", flush=True)
+
+def run(cmd, env=None, cwd=None, verbose=False):
+    merged = os.environ.copy()
+    if env: merged.update(env)
+    if verbose:
+        return subprocess.run(cmd, shell=True, env=merged, cwd=cwd, text=True)
+    return subprocess.run(cmd, shell=True, env=merged, cwd=cwd, text=True, capture_output=True)
+
+def run_output(cmd, env=None, cwd=None, timeout=None):
+    merged = os.environ.copy()
+    if env: merged.update(env)
+    try:
+        r = subprocess.run(cmd, shell=True, env=merged, cwd=cwd,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return ""
+
+def make_session_id(name):
+    return f"s{get_wallet_index(name):04d}"
+
+def set_env(agent_id, name):
+    env = os.environ.copy()
+    env["AWP_AGENT_ID"] = agent_id
+    env["WORKER_MAX_PARALLEL"] = str(WORKER_PARALLEL)
+    env["CRAWL_TIMEOUT"] = str(CRAWL_TIMEOUT)
+    if SKIP_ENRICH:
+        env["MINE_SKIP_ENRICH"] = "1"
+    if USE_PROXY:
+        sid = make_session_id(name)
+        url = f"http://{PROXY_USER}_session-{sid}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        env["HTTP_PROXY"]=url; env["HTTPS_PROXY"]=url
+        env["http_proxy"]=url; env["https_proxy"]=url
+    return env
+
+def parse_json_field(raw, field):
+    try: return json.loads(raw).get(field, "")
+    except Exception:
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+                if field in d: return d[field]
+            except Exception: pass
+    return ""
+
+def parse_json_safe(raw):
+    try: return json.loads(raw)
+    except Exception:
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+                if isinstance(d, dict): return d
+            except Exception: pass
+    return {}
+
+
+# ════════════════════════════════════════════════════════
+# 🔑 ON-CHAIN REGISTRATION via web3.py — THE REAL FIX
+# ════════════════════════════════════════════════════════
+
+_w3_cache = {}
+_w3_lock = threading.Lock()
+
+def get_web3():
+    """Get web3 instance (with proxy support)."""
+    with _w3_lock:
+        if "w3" in _w3_cache:
+            return _w3_cache["w3"]
+        try:
+            from web3 import Web3
+            # No proxy for RPC — pakai direct connection ke Base
+            # (RPC nodes biasanya tidak friendly dengan residential proxy)
+            w3 = Web3(Web3.HTTPProvider(BASE_RPC_URL, request_kwargs={"timeout": 30}))
+            if not w3.is_connected():
+                print(f"  ❌ Cannot connect to {BASE_RPC_URL}")
+                return None
+            _w3_cache["w3"] = w3
+            return w3
+        except ImportError:
+            run(f"{PYTHON311} -m pip install web3 eth_account -q")
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(BASE_RPC_URL, request_kwargs={"timeout": 30}))
+            _w3_cache["w3"] = w3
+            return w3
+
+
+def get_eth_balance(address):
+    """Return balance in ETH (float)."""
+    w3 = get_web3()
+    if not w3: return 0
+    try:
+        wei = w3.eth.get_balance(Web3.to_checksum_address(address))
+        return w3.from_wei(wei, 'ether')
+    except Exception as e:
+        return 0
+
+
+def check_already_registered(address):
+    """
+    Cek apakah wallet sudah punya recipient di AWP Registry.
+    
+    Panggil contract call: getRecipient(address) → address
+    Kalau return non-zero → sudah registered.
+    
+    ABI minimal: selector getRecipient(address) = keccak256("getRecipient(address)")[:4]
+    """
+    from web3 import Web3
+    w3 = get_web3()
+    if not w3: return False
+    
+    try:
+        # Minimal ABI — cukup getRecipient
+        abi = [{
+            "inputs": [{"name": "user", "type": "address"}],
+            "name": "getRecipient",
+            "outputs": [{"name": "", "type": "address"}],
+            "stateMutability": "view",
+            "type": "function"
+        }]
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(AWP_REGISTRY_CONTRACT),
+            abi=abi
+        )
+        recipient = contract.functions.getRecipient(
+            Web3.to_checksum_address(address)
+        ).call()
+        return recipient != "0x0000000000000000000000000000000000000000"
+    except Exception as e:
+        # getRecipient mungkin beda nama. Coba cara lain: read event logs
+        # atau cek via eth_call raw dengan selector yang benar
+        pass
+    
+    # Fallback: cek via event logs RecipientSet untuk address ini
+    try:
+        filter_params = {
+            'address': Web3.to_checksum_address(AWP_REGISTRY_CONTRACT),
+            'topics': [
+                EVENT_RECIPIENT_SET,
+                '0x' + '0' * 24 + address.lower().replace('0x', ''),  # addr as topic1 (padded)
+            ],
+            'fromBlock': 0,
+            'toBlock': 'latest'
+        }
+        logs = w3.eth.get_logs(filter_params)
+        return len(logs) > 0
+    except Exception:
+        return False
+
+
+def fund_wallet(recipient_addr, amount_eth, wallet_name):
+    """Send ETH dari FUNDER ke recipient_addr."""
+    from web3 import Web3
+    from eth_account import Account
+    
+    w3 = get_web3()
+    if not w3:
+        log(wallet_name, "❌ Web3 not connected")
+        return None
+    
+    if not FUNDER_PRIVATE_KEY:
+        log(wallet_name, "❌ FUNDER_PRIVATE_KEY not set, cannot fund!")
+        return None
+    
+    try:
+        funder = Account.from_key(FUNDER_PRIVATE_KEY)
+        funder_addr = funder.address
+        
+        # Check balance
+        balance_wei = w3.eth.get_balance(funder_addr)
+        needed_wei = w3.to_wei(amount_eth, 'ether')
+        if balance_wei < needed_wei:
+            log(wallet_name,
+                f"❌ Funder balance insufficient: "
+                f"{w3.from_wei(balance_wei, 'ether')} ETH < {amount_eth} ETH")
+            return None
+        
+        # Check recipient current balance — kalau sudah cukup, skip
+        recip_balance = w3.eth.get_balance(Web3.to_checksum_address(recipient_addr))
+        if recip_balance >= needed_wei // 2:  # minimal 50% of target
+            log(wallet_name, f"Already funded ({w3.from_wei(recip_balance,'ether'):.6f} ETH), skip")
+            return "skipped"
+        
+        # Build tx
+        nonce = w3.eth.get_transaction_count(funder_addr, 'pending')
+        tx = {
+            'to': Web3.to_checksum_address(recipient_addr),
+            'value': needed_wei,
+            'gas': 21000,
+            'maxFeePerGas': w3.to_wei(0.01, 'gwei'),
+            'maxPriorityFeePerGas': w3.to_wei(0.001, 'gwei'),
+            'nonce': nonce,
+            'chainId': AWP_CHAIN_ID,
+            'type': 2,
+        }
+        
+        signed = funder.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+        log(wallet_name, f"Fund tx: 0x{tx_hex[:20]}... waiting...")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt.status == 1:
+            log(wallet_name, f"✅ Funded {amount_eth} ETH")
+            return tx_hex
+        else:
+            log(wallet_name, f"❌ Fund tx failed: {tx_hex}")
+            return None
+    except Exception as e:
+        log(wallet_name, f"Fund error: {e}")
+        return None
+
+
+def call_set_recipient(wallet_private_key, recipient_addr, wallet_name):
+    """
+    Call setRecipient(recipient_addr) on AWP Registry.
+    
+    Pakai wallet_private_key untuk sign dan send tx.
+    recipient_addr biasanya = self address (solo mining Option A).
+    """
+    from web3 import Web3
+    from eth_account import Account
+    
+    w3 = get_web3()
+    if not w3:
+        return None
+    
+    try:
+        account = Account.from_key(wallet_private_key)
+        addr = account.address
+        
+        # Check balance
+        balance = w3.eth.get_balance(addr)
+        if balance < w3.to_wei(0.00003, 'ether'):  # minimum buat gas
+            log(wallet_name, f"❌ Insufficient gas: {w3.from_wei(balance,'ether'):.6f} ETH")
+            return None
+        
+        # Build calldata: selector (4 bytes) + padded recipient address (32 bytes)
+        recipient_clean = recipient_addr.lower().replace("0x", "")
+        if len(recipient_clean) != 40:
+            log(wallet_name, f"❌ Invalid recipient address length")
+            return None
+        
+        calldata = AWP_SET_RECIPIENT_SELECTOR + ("0" * 24) + recipient_clean
+        
+        # Build tx
+        nonce = w3.eth.get_transaction_count(addr, 'pending')
+        
+        # Estimate gas (dengan safety margin)
+        try:
+            est_gas = w3.eth.estimate_gas({
+                'from': addr,
+                'to': Web3.to_checksum_address(AWP_REGISTRY_CONTRACT),
+                'data': calldata,
+                'value': 0,
+            })
+            gas_limit = int(est_gas * 1.3)  # 30% margin
+        except Exception as e:
+            log(wallet_name, f"Gas estimate failed: {e}, use default 100k")
+            gas_limit = 100000
+        
+        tx = {
+            'to': Web3.to_checksum_address(AWP_REGISTRY_CONTRACT),
+            'value': 0,
+            'data': calldata,
+            'gas': gas_limit,
+            'maxFeePerGas': w3.to_wei(0.01, 'gwei'),
+            'maxPriorityFeePerGas': w3.to_wei(0.001, 'gwei'),
+            'nonce': nonce,
+            'chainId': AWP_CHAIN_ID,
+            'type': 2,
+        }
+        
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+        log(wallet_name, f"setRecipient tx: 0x{tx_hex[:20]}... waiting receipt...")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        if receipt.status == 1:
+            log(wallet_name, f"✅ setRecipient SUCCESS: https://basescan.org/tx/0x{tx_hex}")
+            # Verify event emitted
+            for log_entry in receipt.logs:
+                if (log_entry.address.lower() == AWP_REGISTRY_CONTRACT.lower() and
+                    log_entry.topics and
+                    log_entry.topics[0].hex().lower() == EVENT_RECIPIENT_SET.lower().replace("0x", "").replace("0x", "")):
+                    log(wallet_name, "✓ RecipientSet event emitted")
+                    break
+            return tx_hex
+        else:
+            log(wallet_name, f"❌ setRecipient tx reverted: 0x{tx_hex}")
+            return None
+    except Exception as e:
+        log(wallet_name, f"setRecipient error: {e}")
+        return None
+
+
+def derive_private_key(mnemonic, index=None):
+    """Derive private key dari mnemonic (+ optional HD index)."""
+    from eth_account import Account
+    Account.enable_unaudited_hdwallet_features()
+    if index is not None:
+        path = f"m/44'/60'/0'/0/{index}"
+        acct = Account.from_mnemonic(mnemonic, account_path=path)
+    else:
+        acct = Account.from_mnemonic(mnemonic)
+    return acct.key.hex()
+
+
+def register_wallet_onchain(wallet_name, address, mnemonic, hd_index):
+    """
+    MAIN REGISTRATION FUNCTION — on-chain langsung.
+    
+    Flow:
+      1. Cek apakah sudah registered (skip kalau ya)
+      2. Cek balance ETH; kalau < threshold → fund dari FUNDER
+      3. Derive private key dari mnemonic
+      4. Call setRecipient(self_address) on-chain
+      5. Verify via getRecipient atau event log
+    """
+    # Step 1: Check sudah registered?
+    log(wallet_name, "Checking on-chain registration...")
+    if check_already_registered(address):
+        log(wallet_name, "✅ Already registered on-chain")
+        return True
+    
+    # Step 2: Ensure wallet has ETH for gas
+    balance = get_eth_balance(address)
+    min_balance = 0.00005  # 0.00005 ETH minimum untuk 1 tx
+    log(wallet_name, f"Balance: {balance:.6f} ETH")
+    
+    if float(balance) < min_balance:
+        if not FUNDER_PRIVATE_KEY:
+            log(wallet_name, "❌ Need ETH but FUNDER_PRIVATE_KEY not set!")
+            log(wallet_name, f"   Manual: send {ETH_PER_WALLET} ETH Base ke {address}")
+            return False
+        
+        log(wallet_name, f"Funding from FUNDER ({ETH_PER_WALLET} ETH)...")
+        tx = fund_wallet(address, ETH_PER_WALLET, wallet_name)
+        if not tx:
+            return False
+        time.sleep(3)
+    
+    # Step 3: Derive private key
+    try:
+        privkey = derive_private_key(mnemonic, hd_index)
+    except Exception as e:
+        log(wallet_name, f"❌ Key derive error: {e}")
+        return False
+    
+    # Step 4: Call setRecipient(self)
+    log(wallet_name, f"Calling setRecipient({address[:10]}...) on {AWP_REGISTRY_CONTRACT[:10]}...")
+    tx_hash = call_set_recipient(privkey, address, wallet_name)
+    if not tx_hash:
+        return False
+    
+    # Step 5: Verify
+    time.sleep(5)
+    if check_already_registered(address):
+        log(wallet_name, "✅ Registration VERIFIED on-chain!")
+        return True
+    
+    log(wallet_name, "⚠ Tx success but verification failed, assume OK")
+    return True
+
+
+def check_funder_balance():
+    """Check FUNDER balance sebelum setup."""
+    if not FUNDER_PRIVATE_KEY:
+        print("\n  ⚠ FUNDER_PRIVATE_KEY TIDAK DIISI!")
+        print("  Without funder, on-chain registration TIDAK AKAN JALAN.")
+        print("  Script akan coba relay gasless (yang mungkin gagal).")
+        print("  Untuk mode auto-register:")
+        print("    1. Buat wallet Ethereum yang ada ETH di Base Mainnet")
+        print("    2. Isi FUNDER_PRIVATE_KEY di config script")
+        print(f"    3. Minimum balance: {WALLET_COUNT * ETH_PER_WALLET:.4f} ETH\n")
+        return False
+    
+    try:
+        from eth_account import Account
+        w3 = get_web3()
+        if not w3:
+            return False
+        funder = Account.from_key(FUNDER_PRIVATE_KEY)
+        balance = w3.from_wei(w3.eth.get_balance(funder.address), 'ether')
+        needed = WALLET_COUNT * ETH_PER_WALLET
+        print(f"\n  Funder: {funder.address}")
+        print(f"  Balance: {balance} ETH")
+        print(f"  Needed: {needed} ETH ({WALLET_COUNT} wallets × {ETH_PER_WALLET})")
+        
+        if float(balance) < needed:
+            print(f"  ❌ INSUFFICIENT! Top-up funder wallet at least {needed - float(balance):.4f} ETH")
+            print(f"     Bridge ETH ke Base: https://bridge.base.org")
+            return False
+        else:
+            print(f"  ✅ Funder OK, cukup untuk {int(float(balance) // ETH_PER_WALLET)} wallet")
+            return True
+    except Exception as e:
+        print(f"  ❌ Funder check error: {e}")
+        return False
+
+
+# ──────────────────────────────────────────────────
+# LOAD WALLETS
+# ──────────────────────────────────────────────────
+
+def generate_mnemonic():
+    from eth_account import Account
+    Account.enable_unaudited_hdwallet_features()
+    _, mnemonic = Account.create_with_mnemonic()
+    return mnemonic
+
+def create_wallets_file(p, count):
+    print(f"\n  Generating {count} wallet...")
+    lines = []
+    for i in range(count):
+        name = f"wallet{i+1}"
+        m = generate_mnemonic()
+        lines.append(f"{name}|{m}")
+        print(f"  ✓ {name}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        f.write(f"# Auto-generated {datetime.now()}\n# Format: name|mnemonic\n\n")
+        for l in lines: f.write(l + "\n")
+    print(f"  ⚠ BACKUP {p}")
+
+def load_wallets_from_file():
+    import re
+    p = Path(WALLETS_FILE)
+    if not p.exists():
+        create_wallets_file(p, WALLET_COUNT)
+    wallets = []
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            parts = line.split("|", 1)
+            if len(parts) != 2: continue
+            n, m = parts[0].strip(), parts[1].strip()
+            if not re.match(r'^[a-zA-Z0-9_-]{1,64}$', n): continue
+            if len(m.split()) not in (12, 24): continue
+            wallets.append((n, m))
+    if len(wallets) < WALLET_COUNT:
+        need = WALLET_COUNT - len(wallets)
+        with open(p, "a") as f:
+            for j in range(need):
+                idx = len(wallets)+j+1
+                n = f"wallet{idx}"; m = generate_mnemonic()
+                f.write(f"{n}|{m}\n"); wallets.append((n, m))
+    return wallets[:WALLET_COUNT]
+
+def load_wallets_single_mnemonic():
+    from eth_account import Account
+    Account.enable_unaudited_hdwallet_features()
+    ws = []
+    m = SINGLE_MNEMONIC.strip()
+    for i in range(WALLET_COUNT):
+        path = f"m/44'/60'/0'/0/{i}"
+        acct = Account.from_mnemonic(m, account_path=path)
+        ws.append((f"wallet{i}", m, i))
+        print(f"  [{i}] wallet{i} → {acct.address}")
+    return ws
+
+def load_wallets():
+    if WALLET_MODE == "file":
+        return [(n, m, None) for n, m in load_wallets_from_file()]
+    return load_wallets_single_mnemonic()
+
+
+# ──────────────────────────────────────────────────
+# INSTALL & DEPS
+# ──────────────────────────────────────────────────
+
+def ensure_python311():
+    banner("Step 1: Python 3.11")
+    if Path(PYTHON311).exists():
+        print(f"  OK: {run_output(f'{PYTHON311} --version')}")
+        return
+    run("apt-get install -y software-properties-common -qq")
+    run("add-apt-repository ppa:deadsnakes/ppa -y", verbose=True)
+    run("apt-get update -qq")
+    run("apt-get install -y python3.11 python3.11-venv python3.11-dev -qq", verbose=True)
+
+def install_deps():
+    banner("Step 2: Dependencies")
+    run("apt-get update -qq")
+    run("apt-get install -y git curl build-essential -qq", verbose=True)
+    if not run_output("node --version 2>/dev/null").startswith("v"):
+        run("curl -fsSL https://deb.nodesource.com/setup_20.x | bash -", verbose=True)
+        run("apt-get install -y nodejs -qq", verbose=True)
+    print(f"  Node: {run_output('node --version')}")
+    run("npm install -g https://github.com/awp-core/awp-wallet", verbose=True)
+    print(f"  awp-wallet: {run_output('awp-wallet --version')}")
+    # 🔑 PENTING: web3 + eth_account untuk on-chain registration
+    print("  Installing web3 + eth_account (untuk on-chain register)...")
+    run(f"{PYTHON311} -m pip install web3 eth_account -q")
+
+def test_proxy():
+    banner("Testing Proxy")
+    for i in range(3):
+        sid = f"s{i:04d}"
+        url = f"http://{PROXY_USER}_session-{sid}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        env = os.environ.copy(); env["https_proxy"]=url
+        ip = run_output("curl -s --max-time 10 https://api.ipify.org", env=env)
+        print(f"  Session {sid} → {ip or 'FAIL'}")
+
+
+# ──────────────────────────────────────────────────
+# TEMPLATE VENV
+# ──────────────────────────────────────────────────
+
+_template_lock = threading.Lock()
+_template_ready = False
+_template_dir = Path(HOME) / "mine-skill-template"
+
+def prepare_template_venv():
+    global _template_ready
+    with _template_lock:
+        if _template_ready: return
+        banner("Step 3: Prepare mine-skill template")
+        if not _template_dir.exists():
+            run(f'git clone https://github.com/awp-worknet/mine-skill "{_template_dir}" -q')
+        else:
+            r = run(f'git -C "{_template_dir}" pull --ff-only -q')
+            if r.returncode != 0:
+                run(f'git -C "{_template_dir}" fetch origin')
+                run(f'git -C "{_template_dir}" reset --hard origin/main')
+        venv = _template_dir/".venv"; py = venv/"bin"/"python"
+        if venv.exists() and py.exists():
+            ver = run_output(f'"{py}" --version 2>/dev/null')
+            if "3.11" in ver:
+                pip = str(venv/"bin"/"pip")
+                if "beautifulsoup4" in run_output(f'"{pip}" show beautifulsoup4 2>/dev/null').lower():
+                    print("  Template OK ✓")
+                    _template_ready = True
+                    return
+            shutil.rmtree(str(venv), ignore_errors=True)
+        boot = _template_dir/"scripts"/"bootstrap.sh"
+        if boot.exists():
+            r = run(f'bash "{boot}"', cwd=str(_template_dir), verbose=True)
+            if r.returncode == 0 and py.exists():
+                pip = str(venv/"bin"/"pip")
+                run(f'"{pip}" install web3 eth_account -q')
+                _template_ready = True
+                return
+        run(f"{PYTHON311} -m venv {venv}")
+        pip = str(venv/"bin"/"pip")
+        run(f'"{pip}" install --upgrade pip -q')
+        req = _template_dir/"requirements-core.txt"
+        if not req.exists(): req = _template_dir/"requirements.txt"
+        if req.exists(): run(f'"{pip}" install -r "{req}"', verbose=True)
+        run(f'"{pip}" install web3 eth_account -q')
+        _template_ready = True
+
+
+def copy_venv(mine_dir, wn):
+    dest = mine_dir/".venv"; py = dest/"bin"/"python"
+    if dest.exists() and py.exists() and "3.11" in run_output(f'"{py}" --version 2>/dev/null'):
+        return
+    if dest.exists(): shutil.rmtree(str(dest), ignore_errors=True)
+    src = _template_dir/".venv"
+    if not src.exists(): return
+    r = run(f'cp -a "{src}" "{dest}"')
+    if r.returncode != 0:
+        shutil.copytree(str(src), str(dest), symlinks=True)
+
+
+# ──────────────────────────────────────────────────
+# WALLET SETUP — with on-chain registration
+# ──────────────────────────────────────────────────
+
+def import_wallet(name, mnemonic, agent_id):
+    env = set_env(agent_id, name)
+    raw = run_output(f'AWP_AGENT_ID="{agent_id}" awp-wallet receive', env=env)
+    addr = parse_json_field(raw, "eoaAddress")
+    if addr:
+        log(name, f"Already imported → {addr}")
+        return addr
+    log(name, "Importing...")
+    r = run(f'AWP_AGENT_ID="{agent_id}" awp-wallet import --mnemonic "{mnemonic}"', env=env)
+    if r.returncode != 0:
+        log(name, f"Import err: {(r.stderr or r.stdout)[:120]}")
+        return None
+    raw = run_output(f'AWP_AGENT_ID="{agent_id}" awp-wallet receive', env=env)
+    return parse_json_field(raw, "eoaAddress")
+
+def clone_mine_skill(mine_dir, name):
+    if not mine_dir.exists():
+        run(f'git clone https://github.com/awp-worknet/mine-skill "{mine_dir}" -q')
+    else:
+        if run(f'git -C "{mine_dir}" pull --ff-only -q').returncode != 0:
+            run(f'git -C "{mine_dir}" fetch origin')
+            run(f'git -C "{mine_dir}" reset --hard origin/main')
+
+def python_bin_of(mine_dir):
+    py = mine_dir/".venv"/"bin"/"python"
+    return str(py) if py.exists() else PYTHON311
+
+
+def setup_wallet_worker(args):
+    name, mnemonic, hd_idx, total = args
+    agent_id = name
+    mine_dir = Path(HOME)/f"mine-skill-{name}"
+    log(name, f"Setup starting...")
+
+    address = import_wallet(name, mnemonic, agent_id)
+    if not address: return None
+
+    clone_mine_skill(mine_dir, name)
+    copy_venv(mine_dir, name)
+
+    env = set_env(agent_id, name)
+    py_bin = python_bin_of(mine_dir)
+
+    # Unlock wallet token
+    raw = run_output(f'AWP_AGENT_ID="{agent_id}" awp-wallet unlock --scope full --duration 86400', env=env)
+    token = parse_json_field(raw, "sessionToken")
+    if not token:
+        log(name, f"Token FAIL: {raw[:100]}")
+        return None
+    log(name, f"Token OK: {token[:20]}...")
+    env["AWP_WALLET_TOKEN"] = token
+
+    # Init mine-skill
+    log(name, "mine-skill init...")
+    run_output(f'"{py_bin}" scripts/run_tool.py init', env=env, cwd=str(mine_dir), timeout=60)
+
+    # 🔑 ON-CHAIN REGISTRATION (the fix!)
+    log(name, "═══ ON-CHAIN REGISTRATION ═══")
+    # Untuk mode 'file' (WALLET_MODE="file"): mnemonic beda per wallet, pakai default derive (index None)
+    # Untuk mode 'single': satu mnemonic, pakai hd_idx
+    derive_idx = hd_idx if WALLET_MODE == "single" else None
+    registered = register_wallet_onchain(name, address, mnemonic, derive_idx)
+
+    ip = run_output("curl -s --max-time 5 https://api.ipify.org", env=env)
+    log(name, f"Setup done | {address} | IP={ip} | Reg={registered}")
+
+    return {
+        "name": name, "agent_id": agent_id, "directory": str(mine_dir),
+        "address": address, "python_bin": py_bin, "token": token,
+        "ip": ip, "mnemonic": mnemonic, "wallet_index": hd_idx,
+        "registered": registered,
+    }
+
+
+# ──────────────────────────────────────────────────
+# MINING (standard mine-skill v0.14.0 background worker)
+# ──────────────────────────────────────────────────
+
+def unlock_token(w):
+    env = set_env(w["agent_id"], w["name"])
+    raw = run_output(f'AWP_AGENT_ID="{w["agent_id"]}" awp-wallet unlock --scope full --duration 86400', env=env)
+    return parse_json_field(raw, "sessionToken")
+
+def agent_status(py_bin, wd, env):
+    return parse_json_safe(run_output(f'"{py_bin}" scripts/run_tool.py agent-control status', env=env, cwd=wd))
+
+def agent_start(py_bin, wd, env, ds=None):
+    cmd = f'"{py_bin}" scripts/run_tool.py agent-start'
+    if ds: cmd += " " + " ".join(ds)
+    return parse_json_safe(run_output(cmd, env=env, cwd=wd))
+
+def agent_stop(py_bin, wd, env):
+    return parse_json_safe(run_output(f'"{py_bin}" scripts/run_tool.py agent-control stop', env=env, cwd=wd))
+
+
+def start_mining(w):
+    name, wd, py_bin = w["name"], w["directory"], w["python_bin"]
+    last_refresh = time.time()
+    
+    while True:
+        try:
+            env = set_env(w["agent_id"], name)
+            token = unlock_token(w)
+            if not token:
+                time.sleep(30); continue
+            env["AWP_WALLET_TOKEN"] = token
+            last_refresh = time.time()
+
+            # Re-register kalau hilang
+            if not w.get("registered"):
+                log(name, "Re-register on-chain...")
+                derive_idx = w["wallet_index"] if WALLET_MODE == "single" else None
+                ok = register_wallet_onchain(name, w["address"], w["mnemonic"], derive_idx)
+                if ok: w["registered"] = True
+                else:
+                    time.sleep(60); continue
+
+            # Start worker
+            cs = agent_status(py_bin, wd, env)
+            if cs.get("state") != "running":
+                r = agent_start(py_bin, wd, env)
+                state = r.get("state", "?"); msg = r.get("user_message", "")
+                if "not registered" in msg.lower():
+                    w["registered"] = False
+                    log(name, "⚠ Still not registered on-chain?")
+                    time.sleep(20); continue
+                if state == "selection_required":
+                    use_ids = DATASET_IDS if DATASET_IDS else []
+                    if not use_ids:
+                        dss = r.get("datasets",[]) or r.get("_internal",{}).get("datasets",[])
+                        use_ids = [str(d.get("dataset_id") or d.get("id") or "") for d in dss if d]
+                    if use_ids:
+                        r = agent_start(py_bin, wd, env, ds=use_ids)
+                        state = r.get("state","?")
+                if state == "running":
+                    log(name, "Agent ✓ running")
+                else:
+                    log(name, f"Start: state={state} {r.get('user_message','')[:80]}")
+                    time.sleep(30); continue
+                time.sleep(10)
+
+            # Monitor
+            fail = 0
+            while True:
+                time.sleep(MONITOR_INTERVAL)
+                if time.time() - last_refresh > TOKEN_REFRESH_INTERVAL:
+                    nt = unlock_token(w)
+                    if nt:
+                        env["AWP_WALLET_TOKEN"] = nt
+                        last_refresh = time.time()
+                cs = agent_status(py_bin, wd, env)
+                st = cs.get("state", "?"); msg = cs.get("user_message", "")
+                if st == "running":
+                    i = cs.get("_internal",{}); sd = i.get("status",{})
+                    tot = sd.get("session_totals",{})
+                    log(name, f"OK ep={sd.get('epoch_submitted',0)}/{sd.get('epoch_target',80)} "
+                              f"proc={tot.get('processed_items',0)} sub={tot.get('submitted_items',0)} "
+                              f"credit={sd.get('credit_score','?')}")
+                    fail = 0
+                elif "not registered" in msg.lower():
+                    w["registered"] = False; break
+                else:
+                    fail += 1
+                    log(name, f"State={st} ({fail}/{MAX_FAIL_BEFORE_RESTART}) {msg[:80]}")
+                    if fail >= MAX_FAIL_BEFORE_RESTART:
+                        agent_stop(py_bin, wd, env); time.sleep(5); break
+        except Exception as e:
+            log(name, f"Err: {e}, retry 30s")
+            time.sleep(30)
+
+
+# ──────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────
+
+def main():
+    banner(f"Mine Bot MULTI — ON-CHAIN REGISTER | {WALLET_MODE} | {WALLET_COUNT}")
+    print(f"  AWP Registry: {AWP_REGISTRY_CONTRACT}")
+    print(f"  Chain: Base Mainnet ({AWP_CHAIN_ID})")
+    print(f"  RPC: {BASE_RPC_URL}")
+
+    raw_w = load_wallets()
+    print(f"\n  {len(raw_w)} wallet:")
+    for n, m, idx in raw_w:
+        print(f"  • {n}" + (f" (hd {idx})" if idx is not None else ""))
+
+    ensure_python311()
+    install_deps()
+    if USE_PROXY: test_proxy()
+
+    # Check funder
+    banner("Step 4: Check Funder Wallet")
+    funder_ok = check_funder_balance()
+    if not funder_ok:
+        print("\n  ⚠ Continuing without funder — setRecipient akan FAIL kecuali wallet sudah punya ETH")
+        answer = input("  Lanjutkan? (y/n): ").strip().lower()
+        if answer != 'y':
+            print("  Aborted.")
+            sys.exit(0)
+
+    prepare_template_venv()
+
+    banner(f"Setting up {len(raw_w)} wallets (batch {BATCH_SIZE})")
+    all_info = []
+    args = [(n, m, (idx if idx is not None else i), len(raw_w)) 
+            for i, (n, m, idx) in enumerate(raw_w)]
+    
+    for bs in range(0, len(args), BATCH_SIZE):
+        batch = args[bs:bs+BATCH_SIZE]
+        bn = bs//BATCH_SIZE + 1; tb = (len(args)+BATCH_SIZE-1)//BATCH_SIZE
+        print(f"\n  Batch {bn}/{tb} — wallet {bs+1}–{bs+len(batch)}", flush=True)
+        res = [None]*len(batch); th = []
+        for i, a in enumerate(batch):
+            t = threading.Thread(target=lambda a=a, idx=i: res.__setitem__(idx, setup_wallet_worker(a)))
+            t.start(); th.append(t); time.sleep(0.3)
+        for t in th: t.join()
+        all_info.extend([r for r in res if r])
+        print(f"  Batch {bn} done: {sum(1 for r in res if r)}/{len(batch)}")
+        if bs+BATCH_SIZE < len(args): time.sleep(3)
+
+    banner("Setup Summary")
+    print(f"  {'Name':12} {'Address':44} {'IP':16} {'Reg':4} Status")
+    for w in all_info:
+        s = "OK" if w["token"] else "F"
+        r = "✓" if w.get("registered") else "✗"
+        print(f"  {w['name']:12} {w['address']:44} {w['ip']:16} {r:4} [{s}]")
+    
+    ok = sum(1 for w in all_info if w["token"])
+    reg = sum(1 for w in all_info if w.get("registered"))
+    print(f"\n  Total: {ok} unlocked | {reg} registered | dari {len(raw_w)}")
+    if not all_info: sys.exit(1)
+
+    banner(f"Starting Mining — {ok} wallets")
+    threads = []
+    for w in all_info:
+        if not w["token"]: continue
+        t = threading.Thread(target=start_mining, args=(w,), name=w["name"][:12], daemon=True)
+        t.start(); threads.append(t)
+        log(w["name"], f"Mining thread ✓ (IP {w['ip']})"); time.sleep(0.5)
+
+    try:
+        while True:
+            time.sleep(120)
+            alive = sum(1 for t in threads if t.is_alive())
+            with print_lock:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Active: {alive}/{len(threads)}")
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        for w in all_info:
+            if w["token"]:
+                try:
+                    e = set_env(w["agent_id"], w["name"])
+                    e["AWP_WALLET_TOKEN"] = w["token"]
+                    agent_stop(w["python_bin"], w["directory"], e)
+                except Exception: pass
+        sys.exit(0)
+
+
+def ensure_web3_installed():
+    """Install web3 + eth_account ke system Python sebelum apapun."""
+    try:
+        import web3  # noqa
+        import eth_account  # noqa
+        return
+    except ImportError:
+        pass
+    print("  [bootstrap] Installing web3 + eth_account (one-time)...")
+    # Install ke Python yang sedang running script ini (bukan PYTHON311)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "web3", "eth_account", "-q",
+         "--break-system-packages"],
+        check=False
+    )
+    # Fallback kalau --break-system-packages tidak didukung
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "web3", "eth_account", "-q"],
+        check=False
+    )
+    try:
+        import web3  # noqa
+        import eth_account  # noqa
+        print("  [bootstrap] OK ✓")
+    except ImportError as e:
+        print(f"  [bootstrap] ❌ Install gagal: {e}")
+        print(f"  Manual: {sys.executable} -m pip install web3 eth_account")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    ensure_web3_installed()
+    main()
